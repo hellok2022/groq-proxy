@@ -137,7 +137,7 @@ Deno.serve(async (req) => {
       method: req.method,
       headers: fwdHeaders,
       body,
-      redirect: "manual", // ⚠️ 禁止自动跟随重定向，防止绕过白名单
+      redirect: "manual", // 禁止自动跟随重定向，防止绕过白名单
       signal: abortCtrl.signal,
     });
     clearTimeout(timer);
