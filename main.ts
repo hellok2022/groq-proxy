@@ -1,20 +1,23 @@
-// main.ts - Hardened Production Proxy
+// main.ts - Hardened Production Proxy for Codex + Grok
 import { timingSafeEqual } from "https://deno.land/std@0.224.0/crypto/timing_safe_equal.ts";
 
 // ==================== 配置区 ====================
 const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN");
-if (!AUTH_TOKEN) throw new Error("FATAL: AUTH_TOKEN not set");
+if (!AUTH_TOKEN) throw new Error("FATAL: AUTH_TOKEN environment variable not set");
 
-// 将 Token 预编码为 Uint8Array，避免每次请求重复编码
+// 预编码 Token，避免每次请求重复编码
 const AUTH_TOKEN_BYTES = new TextEncoder().encode(AUTH_TOKEN);
 
+// ✅ 已添加 api.x.ai (Grok/xAI)
 const ALLOWED_ORIGINS = new Set([
   "api.openai.com",
   "generativelanguage.googleapis.com",
+  "api.anthropic.com",
+  "api.x.ai",
 ]);
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
-const UPSTREAM_TIMEOUT_MS = 60_000;
+const UPSTREAM_TIMEOUT_MS = 120_000; // Codex 任务可能较长，建议 120s
 const ALLOWED_PROTOCOLS = new Set(["https:"]);
 
 // 仅透传这些响应头给客户端
@@ -22,6 +25,7 @@ const SAFE_RESPONSE_HEADERS = new Set([
   "content-type", "content-length", "transfer-encoding",
   "cache-control", "etag", "last-modified",
   "x-request-id", "openai-version", "openai-organization",
+  "anthropic-version", "x-ratelimit-limit", "x-ratelimit-remaining",
 ]);
 
 // ==================== 工具函数 ====================
@@ -32,14 +36,34 @@ function jsonError(msg: string, status: number): Response {
   });
 }
 
-function verifyToken(provided: string | null): boolean {
-  if (!provided) return false;
-  const prefix = "Bearer ";
-  if (!provided.startsWith(prefix)) return false;
-  const tokenBytes = new TextEncoder().encode(provided.slice(prefix.length));
-  // 长度不同直接返回 false（timingSafeEqual 要求等长）
-  if (tokenBytes.length !== AUTH_TOKEN_BYTES.length) return false;
-  return timingSafeEqual(tokenBytes, AUTH_TOKEN_BYTES);
+/**
+ * 验证 Token（支持 Header Bearer 和 URL Query 两种模式）
+ * @param headerAuth - Authorization header 值
+ * @param queryToken - URL ?token= 参数值
+ */
+function verifyAuth(headerAuth: string | null, queryToken: string | null): boolean {
+  // 优先验证 Header (标准模式)
+  if (headerAuth) {
+    const prefix = "Bearer ";
+    if (headerAuth.startsWith(prefix)) {
+      const tokenBytes = new TextEncoder().encode(headerAuth.slice(prefix.length));
+      if (tokenBytes.length === AUTH_TOKEN_BYTES.length &&
+          timingSafeEqual(tokenBytes, AUTH_TOKEN_BYTES)) {
+        return true;
+      }
+    }
+  }
+
+  // 回退验证 URL 参数 (Codex CLI 兼容模式)
+  if (queryToken) {
+    const queryBytes = new TextEncoder().encode(queryToken);
+    if (queryBytes.length === AUTH_TOKEN_BYTES.length &&
+        timingSafeEqual(queryBytes, AUTH_TOKEN_BYTES)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function validateTarget(urlStr: string): URL | null {
@@ -86,15 +110,19 @@ function sizeLimitedStream(
 
 // ==================== 主服务 ====================
 Deno.serve(async (req) => {
-  // 1. 鉴权（恒定时间比较）
-  if (!verifyToken(req.headers.get("Authorization"))) {
-    // 故意延迟一点，防止无 Token 时的快速失败成为侧信道
+  const reqUrl = new URL(req.url);
+
+  // 1. 双重鉴权（Header 优先，URL 参数回退）
+  const headerAuth = req.headers.get("Authorization");
+  const queryToken = reqUrl.searchParams.get("token");
+
+  if (!verifyAuth(headerAuth, queryToken)) {
+    // 故意延迟，防止侧信道攻击
     await new Promise((r) => setTimeout(r, 50));
     return jsonError("Unauthorized", 401);
   }
 
   // 2. 解析目标 URL
-  const reqUrl = new URL(req.url);
   let rawTarget: string | null = null;
   if (reqUrl.pathname.startsWith("/proxy/")) {
     rawTarget = decodeURIComponent(reqUrl.pathname.slice("/proxy/".length));
@@ -115,13 +143,18 @@ Deno.serve(async (req) => {
 
   // 5. 构建安全转发头
   const fwdHeaders = new Headers();
-  const passthroughReqHeaders = ["content-type", "accept", "user-agent", "x-api-key", "authorization"];
+  const passthroughReqHeaders = [
+    "content-type", "accept", "user-agent",
+    "x-api-key", "authorization", "anthropic-version",
+  ];
   for (const h of passthroughReqHeaders) {
     const v = req.headers.get(h);
     if (v) fwdHeaders.set(h, v);
   }
-  // 注意：这里的 authorization 是客户端传给上游 API 的 Key，不是我们的 AUTH_TOKEN
-  // 我们的 AUTH_TOKEN 已在 verifyToken 中消费，不会被转发
+
+  // ⚠️ 关键：如果使用了 URL Token 鉴权，且客户端没有发 Authorization header
+  // 我们需要确保不会把代理的 token 误当作上游 API key 转发
+  // 但由于 verifyAuth 中 URL token 不走 header，这里天然安全
 
   // 6. 带超时 + 大小限制的转发
   const abortCtrl = new AbortController();
@@ -137,7 +170,7 @@ Deno.serve(async (req) => {
       method: req.method,
       headers: fwdHeaders,
       body,
-      redirect: "manual", // 禁止自动跟随重定向，防止绕过白名单
+      redirect: "manual",
       signal: abortCtrl.signal,
     });
     clearTimeout(timer);
